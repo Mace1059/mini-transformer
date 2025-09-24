@@ -15,28 +15,6 @@ n_embed = 128
 n_layers = 3
 moe_weight = 1e-2
 
-# Architectural Hyperparameters
-hyperparameters = {
-    'early': {
-        'ffn_mult': 2,
-        'dropout': 0.05,
-        'lr_scale': 1.2,
-        'n_heads': 8,
-    },
-    'middle': {
-        'ffn_mult': 4,
-        'dropout': 0.1,
-        'lr_scale': 1,
-        'n_heads': 6,
-    },
-    'late': {
-        'ffn_mult': 8,
-        'drouput': 0.3,
-        'lr_scale': 0.8,
-        'n_heads': 4
-    }
-}
-
 
 torch.manual_seed(1337)
 
@@ -98,7 +76,7 @@ class Head(nn.Module):
         k = self.key(x)
         q = self.query(x)
         
-        wei = k @ q.transpose(-2, -1) * C ** -0.5 # (B, T, C) @ (B, C, T) --> (B, T, T)
+        wei = q @ k.transpose(-2, -1) * C ** -0.5 # (B, T, C) @ (B, C, T) --> (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         wei = F.softmax(wei, dim=-1)
         v = self.value(x)
@@ -119,12 +97,12 @@ class MultiHeadAttention(nn.Module):
         return out
 
 class FeedForward(nn.Module):
-    def __init__(self, head_size, dropout):
+    def __init__(self, n_embed, dropout):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(head_size, 4 * head_size), 
+            nn.Linear(n_embed, 4 * n_embed), 
             nn.GELU(), 
-            nn.Linear(4 * head_size, head_size),
+            nn.Linear(4 * n_embed, n_embed),
             nn.Dropout(dropout) 
         )
 
@@ -140,7 +118,7 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(n_embed)
         self.use_moe = use_moe
         if self.use_moe:
-            self.ff = MoEFeedForward(n_embed, ffn_mult, n_experts, top_experts, dropout)
+            self.ff = TernaryMoEFeedForward(n_embed, ffn_mult, n_experts, top_experts, dropout)
         else:
             self.ff = FeedForward(n_embed, dropout)
 
@@ -163,7 +141,7 @@ class BigramLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed) # (B,T,C)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
         self.blocks = nn.ModuleList(
-            [Block(n_embed, n_head=4, ffn_mult=4, dropout=0.5) 
+            [Block(n_embed, n_head=4, ffn_mult=8, dropout=0.5) 
              for _ in range(n_layers)]
         )
         self.ln_f = nn.LayerNorm(n_embed)
@@ -212,39 +190,45 @@ model = BigramLanguageModel()
 m = model.to(device)
 
 
+from torch.cuda.amp import autocast, GradScaler
+
 if __name__ == "__main__":
 
     # Create torch optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-    scaler = torch.amp.GradScaler(device=device)
+    # AMP scaler for mixed precision training
+    scaler = GradScaler()
 
     print("training initiated")
     for iter in range(max_iters):
         if iter % eval_print_interval == 0:
             losses = estimate_loss()
-            print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            print(f"(ternary) step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
         xb, yb = get_batch('train')
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.autocast(device_type="cuda", dtype=torch.float16):
+        # Mixed precision forward pass
+        with autocast(dtype=torch.float16):
             logits, loss = model(xb, yb)
-            moe_aux = sum(getattr(b, "_moe_aux", 0) for b in model.blocks if hasattr(b, '_moe_aux'))
+            moe_aux = sum(getattr(b, "_moe_aux", 0) for b in model.blocks if hasattr(b, "_moe_aux"))
             loss = loss + moe_weight * moe_aux
 
+        # Backward with gradient scaling
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
 
-    torch.save(model.state_dict(), "checkpoints/final_model.pt")
+    torch.save(model.state_dict(), "checkpoints/final_model_ternary.pt")
     print("Final model weights saved!")
 
     final_losses = estimate_loss()
     print(f"Final losses → train: {final_losses['train']:.4f}, val: {final_losses['val']:.4f}")
 
-    torch.save(final_losses, "checkpoints/final_losses.pt")
+    torch.save(final_losses, "checkpoints/final_losses_ternary.pt")
     print("Final losses saved!")
+
 
 # context = torch.zeros((1,1), dtype=torch.long, device=device)
 # print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
