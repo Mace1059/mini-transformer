@@ -18,115 +18,135 @@ using namespace nvcuda;
 #define WMMA_N 16
 #define WMMA_K 16
 
-#define WM_TILE (BM / WARPS_M)        // 32
-#define WN_TILE (BN / WARPS_N)        // 64
-#define WARP_TILES_M (WM_TILE / WMMA_M)  // 2
-#define WARP_TILES_N (WN_TILE / WMMA_N)  // 4
+#define WM_TILE (BM / WARPS_M)            // 32
+#define WN_TILE (BN / WARPS_N)            // 64
+#define WARP_TILES_M (WM_TILE / WMMA_M)   // 2
+#define WARP_TILES_N (WN_TILE / WMMA_N)   // 4
 
+// Kernel
 extern "C" __global__
 void ternary_wmma_gemm_fused(
     const half* __restrict__ A,           // [M x K], row-major
-    const uint32_t* __restrict__ B_nz,    // [K x (N/32)]
-    const uint32_t* __restrict__ B_sgn,   // [K x (N/32)]
+    const uint32_t* __restrict__ B_nz,    // [K x ceil(N/32)], bitplane: nonzero?
+    const uint32_t* __restrict__ B_sgn,   // [K x ceil(N/32)], bitplane: sign (1=-1)
     const float* __restrict__ bias,       // [N] or nullptr
-    half* __restrict__ C,                 // [M x N], row-major (fp16)
+    half* __restrict__ C,                 // [M x N], row-major
     int M, int N, int K,
     float alpha,
     int relu
 ) {
     // Block origin in C
-    int block_m0 = blockIdx.y * BM;
-    int block_n0 = blockIdx.x * BN;
+    const int block_m0 = blockIdx.y * BM;
+    const int block_n0 = blockIdx.x * BN;
     if (block_m0 >= M || block_n0 >= N) return;
 
-    // Lane/warp ids
-    int lane_id = threadIdx.x & 31;           // 0..31
-    int warp_id = threadIdx.x >> 5;           // 0..7
-    int warp_m  = warp_id % WARPS_M;          // 0..3
-    int warp_n  = warp_id / WARPS_M;          // 0..1
+    const int lane_id = threadIdx.x & 31;     // 0..31
+    const int warp_id = threadIdx.x >> 5;     // 0..7
+    const int warp_m  = warp_id % WARPS_M;    // 0..3
+    const int warp_n  = warp_id / WARPS_M;    // 0..1
 
-    int warp_m0 = block_m0 + warp_m * WM_TILE; // 32-step
-    int warp_n0 = block_n0 + warp_n * WN_TILE; // 64-step
+    const int warp_m0 = block_m0 + warp_m * WM_TILE; // 32-step
+    const int warp_n0 = block_n0 + warp_n * WN_TILE; // 64-step
 
-    // Shared memory layout: [A_smem (BM*BK half)] [B_smem (BK*BN half, stored col-major per column of N tile)] [C_scratch ...]
-    extern __shared__ unsigned char smem_uc[];
-    half*  A_smem = reinterpret_cast<half*>(smem_uc);             // [BM, BK], ld=BK
-    half*  B_smem = A_smem + BM * BK;                              // we will store as col-major per N-column, ld=BK
+    // Shared memory: A_smem [BM x BK] (row-major), B_smem [BK x BN] (col-major)
+    extern __shared__ half smem[];
+    half* A_smem = smem;                 // ld = BK
+    half* B_smem = A_smem + BM * BK;     // stored col-major: ld = BK
 
-    // Align C_scratch to 128B for safe WMMA store
-    unsigned char* afterB = reinterpret_cast<unsigned char*>(B_smem + BK * BN);
-    size_t aligned = (reinterpret_cast<size_t>(afterB) + 127) & ~size_t(127);
-    float* C_scratch = reinterpret_cast<float*>(aligned);
-
-    // Accumulators for this warp's 2x4 tiles
+    // Accumulators (2x4 WMMA tiles per warp)
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>
         acc[WARP_TILES_M][WARP_TILES_N];
 
     #pragma unroll
-    for (int tm = 0; tm < WARP_TILES_M; ++tm)
+    for (int tm = 0; tm < WARP_TILES_M; ++tm) {
         #pragma unroll
-        for (int tn = 0; tn < WARP_TILES_N; ++tn)
+        for (int tn = 0; tn < WARP_TILES_N; ++tn) {
             wmma::fill_fragment(acc[tm][tn], 0.0f);
+        }
+    }
 
-    // Iterate over K in BK=16 chunks
+    const int words_per_row = (N + 31) >> 5;  // ceil(N/32)
+
+    // Iterate over K in tiles of BK=16
     for (int k0 = 0; k0 < K; k0 += BK) {
-        // Cooperative load A tile [BM x BK] into shared (ld = BK)
-        for (int i = lane_id; i < BM * BK; i += 32) {
-            int r = i / BK;   // 0..127
-            int c = i % BK;   // 0..15
-            int g_r = block_m0 + r;
-            int g_c = k0 + c;
-            half v = __float2half(0.f);
-            if (g_r < M && g_c < K) v = A[g_r * K + g_c];
+
+        // ---- Cooperative load A tile [BM x BK] into shared (row-major) ----
+        // All 256 threads share the work; no redundant loads.
+        for (int t = threadIdx.x; t < BM * BK; t += blockDim.x) {
+            int r = t / BK;           // 0..127
+            int c = t % BK;           // 0..15
+            int gr = block_m0 + r;
+            int gc = k0 + c;
+            half v = __float2half(0.0f);
+            if (gr < M && gc < K) v = A[gr * K + gc];
             A_smem[r * BK + c] = v;
         }
 
-        // Decode B tile into shared **column-major** with ld = BK
-        // For each column j in this BN tile, its BK entries are contiguous.
-        for (int i = lane_id; i < BK * BN; i += 32) {
-            int kk = i / BN;           // 0..15  -> row within BK slice
-            int j  = i % BN;           // 0..127 -> column within BN tile
-            int g_k = k0 + kk;
-            int g_n = block_n0 + j;
-            half hv = __float2half(0.f);
-            if (g_k < K && g_n < N) {
-                int word_idx = g_n >> 5;
-                int bit_lane = g_n & 31;
-                int stride_words = (N + 31) >> 5;  // words per K-row
-                uint32_t nzb  = B_nz[g_k * stride_words + word_idx];
-                uint32_t sgnb = B_sgn[g_k * stride_words + word_idx];
-                int nz  = (nzb  >> bit_lane) & 1;
-                int sgn = (sgnb >> bit_lane) & 1;
-                if (nz) hv = __int2half_rn(sgn ? -1 : 1);
+        // ---- Decode B for this K-slice into shared (col-major) ----
+        // For each kk in [0..BK), we have BN columns inside the block-N tile.
+        // Expand 32-bit words -> 32 halfs at a time, and store at B_smem[col * BK + kk]
+        for (int t = threadIdx.x; t < BK * ((BN + 31) >> 5); t += blockDim.x) {
+            int kk   = t / ((BN + 31) >> 5);             // 0..15 within this k-slice
+            int widx = t % ((BN + 31) >> 5);             // 0..ceil(BN/32)-1 within tile
+            int gk   = k0 + kk;
+            int gword = (block_n0 >> 5) + widx;          // global word index along N
+
+            uint32_t nz = 0u, sg = 0u;
+            if (gk < K && (gword < words_per_row)) {
+                nz = B_nz[gk * words_per_row + gword];
+                sg = B_sgn[gk * words_per_row + gword];
             }
-            // *** fix 1: store col-major (row=kk, col=j) with ld = BK
-            B_smem[j * BK + kk] = hv;
+
+            // Expand to 32 columns (may spill past N at right edge; guard later)
+            int base_col = (gword << 5) - block_n0;      // local col 0-based within BN
+            // For each bit -> write one half into B_smem at [col * BK + kk]
+            // Keep B_smem col-major so WMMA_B col_major with ld=BK works.
+            #pragma unroll
+            for (int b = 0; b < 32; ++b) {
+                int j = base_col + b;                   // 0..BN-1 (local col)
+                if (j >= 0 && j < BN) {
+                    int g_n = block_n0 + j;
+                    half hv = __float2half(0.0f);
+                    if (gk < K && g_n < N) {
+                        int bit = 1 & (nz >> b);
+                        if (bit) {
+                            int s = 1 & (sg >> b);
+                            hv = __int2half_rn(s ? -1 : 1);
+                        }
+                    }
+                    B_smem[j * BK + kk] = hv;  // col-major write
+                }
+            }
         }
 
         __syncthreads();
 
-        // MMA (A row-major, B col-major)
+        // ---- MMA on this A/B tile ----
+        #pragma unroll
         for (int kk = 0; kk < BK; kk += WMMA_K) {
             #pragma unroll
             for (int tm = 0; tm < WARP_TILES_M; ++tm) {
                 #pragma unroll
                 for (int tn = 0; tn < WARP_TILES_N; ++tn) {
-                    int a_row = (warp_m * WM_TILE) + tm * WMMA_M;
-                    int b_col = (warp_n * WN_TILE) + tn * WMMA_N;
 
+                    const int a_row = (warp_m * WM_TILE) + tm * WMMA_M; // in [0..127]
+                    const int b_col = (warp_n * WN_TILE) + tn * WMMA_N; // in [0..127]
+
+                    // Fragments
                     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K,
                                    half, wmma::row_major> a_frag;
                     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K,
                                    half, wmma::col_major> b_frag;
 
-                    const half* a_ptr = &A_smem[a_row * BK + kk];          // ld = BK
+                    // A_smem is [BM x BK], ld = BK, row-major
+                    const half* a_ptr = &A_smem[a_row * BK + kk];
+                    // B_smem is [BK x BN] but stored col-major, ld = BK
+                    const half* b_ptr = &B_smem[b_col * BK + kk];
 
-                    // *** fix 2: base of B sub-tile for col-major with ld = BK
-                    const half* b_ptr = &B_smem[(b_col * BK) + kk];
-
-                    // *** fix 3: ld for matrix_b col-major is BK
+                    // NOTE: For col_major matrix_b, leading dimension MUST be BK
                     wmma::load_matrix_sync(a_frag, a_ptr, BK);
                     wmma::load_matrix_sync(b_frag, b_ptr, BK);
+
                     wmma::mma_sync(acc[tm][tn], a_frag, b_frag, acc[tm][tn]);
                 }
             }
@@ -135,29 +155,27 @@ void ternary_wmma_gemm_fused(
         __syncthreads();
     }
 
-    // ---- Store (via per-warp shared scratch) + epilogue ----
-    // Each warp has a 256-float scratch at:
-    float* warp_scratch = C_scratch + warp_id * (WMMA_M * WMMA_N);
-
+    // ---- Store (directly to global) with fused epilogue ----
     #pragma unroll
     for (int tm = 0; tm < WARP_TILES_M; ++tm) {
         #pragma unroll
         for (int tn = 0; tn < WARP_TILES_N; ++tn) {
-            int tile_m0 = warp_m0 + tm * WMMA_M;
-            int tile_n0 = warp_n0 + tn * WMMA_N;
+            const int tile_m0 = warp_m0 + tm * WMMA_M;
+            const int tile_n0 = warp_n0 + tn * WMMA_N;
 
-            // Store fragment into shared scratch (warp-cooperative)
-            wmma::store_matrix_sync(warp_scratch, acc[tm][tn], WMMA_N, wmma::mem_row_major);
-            __syncwarp(); // ensure scratch is visible within the warp
+            float out_frag[WMMA_M * WMMA_N];
+            wmma::store_matrix_sync(out_frag, acc[tm][tn], WMMA_N, wmma::mem_row_major);
 
-            // Each lane writes multiple elements from scratch to global
-            for (int t = lane_id; t < WMMA_M * WMMA_N; t += 32) {
-                int i = t / WMMA_N;
-                int j = t % WMMA_N;
+            #pragma unroll
+            for (int i = 0; i < WMMA_M; ++i) {
                 int row = tile_m0 + i;
-                int col = tile_n0 + j;
-                if (row < M && col < N) {
-                    float v = warp_scratch[t] * alpha;
+                if (row >= M) break;
+                #pragma unroll
+                for (int j = 0; j < WMMA_N; ++j) {
+                    int col = tile_n0 + j;
+                    if (col >= N) break;
+
+                    float v = out_frag[i * WMMA_N + j] * alpha;
                     if (bias) v += bias[col];
                     if (relu) v = v > 0.f ? v : 0.f;
                     C[row * N + col] = __float2half_rn(v);
@@ -167,7 +185,7 @@ void ternary_wmma_gemm_fused(
     }
 }
 
-// Host wrapper (signature matches your bindings.cpp)
+// Host wrapper (unchanged signature)
 extern "C"
 void launch_ternary_linear_cuda(const at::Half* A,
                                 const uint32_t* B_nz,
@@ -180,20 +198,13 @@ void launch_ternary_linear_cuda(const at::Half* A,
     dim3 block(256);  // 8 warps × 32 threads
     dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
 
-    // dynamic shared memory:
-    // A_smem (BM*BK half) + B_smem (BK*BN half, stored col-major) + C_scratch (WARPS_PER_BLOCK*WMMA_M*WMMA_N float) + alignment slack
-    size_t bytesA = BM * BK * sizeof(half);                  // 128*16*2 = 4096
-    size_t bytesB = BK * BN * sizeof(half);                  // 16*128*2 = 4096
-    size_t bytesScratch = WARPS_PER_BLOCK * WMMA_M * WMMA_N * sizeof(float); // 8*256*4 = 8192
-    size_t smem_size = bytesA + bytesB + bytesScratch + 128; // +128 for alignment
+    // Shared: A (BM*BK half) + B (BK*BN half)
+    size_t smem_size = (BM * BK + BK * BN) * sizeof(half); // 4096 + 4096 = 8192 bytes
 
     ternary_wmma_gemm_fused<<<grid, block, smem_size>>>(
         reinterpret_cast<const half*>(A),
-        B_nz,
-        B_sgn,
-        bias,
+        B_nz, B_sgn, bias,
         reinterpret_cast<half*>(C),
         M, N, K,
-        alpha,
-        relu);
+        alpha, relu);
 }
