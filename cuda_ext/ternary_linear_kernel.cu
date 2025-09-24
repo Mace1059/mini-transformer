@@ -48,12 +48,12 @@ void ternary_wmma_gemm_fused(
     int warp_m0 = block_m0 + warp_m * WM_TILE; // 32-step
     int warp_n0 = block_n0 + warp_n * WN_TILE; // 64-step
 
-    // Shared memory layout: [A_smem (BM*BK half)] [B_smem (BK*BN half)] [C_scratch (WARPS_PER_BLOCK*WMMA_M*WMMA_N float)]
+    // Shared memory layout: [A_smem (BM*BK half)] [B_smem (BK*BN half, stored col-major per column of N tile)] [C_scratch ...]
     extern __shared__ unsigned char smem_uc[];
-    half*  A_smem = reinterpret_cast<half*>(smem_uc);
-    half*  B_smem = A_smem + BM * BK;
+    half*  A_smem = reinterpret_cast<half*>(smem_uc);             // [BM, BK], ld=BK
+    half*  B_smem = A_smem + BM * BK;                              // we will store as col-major per N-column, ld=BK
 
-    // Align C_scratch to 128B just to be safe for WMMA store
+    // Align C_scratch to 128B for safe WMMA store
     unsigned char* afterB = reinterpret_cast<unsigned char*>(B_smem + BK * BN);
     size_t aligned = (reinterpret_cast<size_t>(afterB) + 127) & ~size_t(127);
     float* C_scratch = reinterpret_cast<float*>(aligned);
@@ -70,8 +70,7 @@ void ternary_wmma_gemm_fused(
 
     // Iterate over K in BK=16 chunks
     for (int k0 = 0; k0 < K; k0 += BK) {
-        // Cooperative load A tile [BM x BK] into shared
-        // (All 8 warps redundantly do it; safe but can be optimized later.)
+        // Cooperative load A tile [BM x BK] into shared (ld = BK)
         for (int i = lane_id; i < BM * BK; i += 32) {
             int r = i / BK;   // 0..127
             int c = i % BK;   // 0..15
@@ -82,10 +81,11 @@ void ternary_wmma_gemm_fused(
             A_smem[r * BK + c] = v;
         }
 
-        // Decode B tile [BK x BN] into shared as half in row-major
+        // Decode B tile into shared **column-major** with ld = BK
+        // For each column j in this BN tile, its BK entries are contiguous.
         for (int i = lane_id; i < BK * BN; i += 32) {
-            int kk = i / BN;           // 0..15
-            int j  = i % BN;           // 0..127
+            int kk = i / BN;           // 0..15  -> row within BK slice
+            int j  = i % BN;           // 0..127 -> column within BN tile
             int g_k = k0 + kk;
             int g_n = block_n0 + j;
             half hv = __float2half(0.f);
@@ -99,12 +99,13 @@ void ternary_wmma_gemm_fused(
                 int sgn = (sgnb >> bit_lane) & 1;
                 if (nz) hv = __int2half_rn(sgn ? -1 : 1);
             }
-            B_smem[kk * BN + j] = hv;
+            // *** fix 1: store col-major (row=kk, col=j) with ld = BK
+            B_smem[j * BK + kk] = hv;
         }
 
         __syncthreads();
 
-        // MMA (A row-major, B row-major)
+        // MMA (A row-major, B col-major)
         for (int kk = 0; kk < BK; kk += WMMA_K) {
             #pragma unroll
             for (int tm = 0; tm < WARP_TILES_M; ++tm) {
@@ -118,11 +119,14 @@ void ternary_wmma_gemm_fused(
                     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K,
                                    half, wmma::col_major> b_frag;
 
-                    const half* a_ptr = &A_smem[a_row * BK + kk];
-                    const half* b_ptr = &B_smem[kk * BN + b_col];
+                    const half* a_ptr = &A_smem[a_row * BK + kk];          // ld = BK
 
-                    wmma::load_matrix_sync(a_frag, a_ptr, BK);  // ld = BK
-                    wmma::load_matrix_sync(b_frag, b_ptr, BN);  // ld = BN
+                    // *** fix 2: base of B sub-tile for col-major with ld = BK
+                    const half* b_ptr = &B_smem[(b_col * BK) + kk];
+
+                    // *** fix 3: ld for matrix_b col-major is BK
+                    wmma::load_matrix_sync(a_frag, a_ptr, BK);
+                    wmma::load_matrix_sync(b_frag, b_ptr, BK);
                     wmma::mma_sync(acc[tm][tn], a_frag, b_frag, acc[tm][tn]);
                 }
             }
@@ -177,11 +181,11 @@ void launch_ternary_linear_cuda(const at::Half* A,
     dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
 
     // dynamic shared memory:
-    // A_smem (BM*BK half) + B_smem (BK*BN half) + C_scratch (WARPS_PER_BLOCK*WMMA_M*WMMA_N float) + a little for alignment
+    // A_smem (BM*BK half) + B_smem (BK*BN half, stored col-major) + C_scratch (WARPS_PER_BLOCK*WMMA_M*WMMA_N float) + alignment slack
     size_t bytesA = BM * BK * sizeof(half);                  // 128*16*2 = 4096
     size_t bytesB = BK * BN * sizeof(half);                  // 16*128*2 = 4096
     size_t bytesScratch = WARPS_PER_BLOCK * WMMA_M * WMMA_N * sizeof(float); // 8*256*4 = 8192
-    size_t smem_size = bytesA + bytesB + bytesScratch + 128; // +128 to allow alignment of scratch
+    size_t smem_size = bytesA + bytesB + bytesScratch + 128; // +128 for alignment
 
     ternary_wmma_gemm_fused<<<grid, block, smem_size>>>(
         reinterpret_cast<const half*>(A),
