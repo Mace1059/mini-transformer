@@ -1,5 +1,5 @@
 import torch
-from src.improvements import BigramLanguageModel, decode, device
+from src.improvements_v2 import BigramLanguageModel, decode, device
 
 # Recreate model
 model = BigramLanguageModel().to(device)

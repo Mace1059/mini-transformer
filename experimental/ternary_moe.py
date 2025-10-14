@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from src.utils import *
+from src.ternary_moe_layers import TernaryMoEFeedForward
 
 # Training-Persistent Hyperparameters
 batch_size = 128

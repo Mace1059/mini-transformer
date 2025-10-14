@@ -1,191 +1,258 @@
+// cuda/ternary_linear_kernel.cu
 #include <cuda.h>
 #include <cuda_fp16.h>
-#include <mma.h>
 #include <ATen/ATen.h>
 
-using namespace nvcuda;
+#ifndef __CUDA_ARCH__
+#define __CUDA_ARCH__ 0
+#endif
 
-// Block tiling params
-#define BM 128
-#define BN 128
-#define BK 16
+// ----------------- Tunables (safe & solid) -----------------
+#define BM 128        // rows per block of C/A
+#define BN 128        // cols per block of C/B
+#define BK 64         // K-slab per iteration
 
-#define WARPS_PER_BLOCK 8
-#define WARPS_M 4
-#define WARPS_N 2
+#define WARPS_PER_BLOCK 4
+#define WARP_SIZE 32
+#define THREADS (WARPS_PER_BLOCK * WARP_SIZE)
 
-#define WMMA_M 16
-#define WMMA_N 16
-#define WMMA_K 16
+// Warp tile (covered per warp after all phases)
+#define WM 64
+#define WN 64
 
-#define WM_TILE (BM / WARPS_M)            // 32
-#define WN_TILE (BN / WARPS_N)            // 64
-#define WARP_TILES_M (WM_TILE / WMMA_M)   // 2
-#define WARP_TILES_N (WN_TILE / WMMA_N)   // 4
+// Per-thread sub-tile (SAFE: no word crossing)
+#define TM 4   // rows per thread
+#define TN 4   // cols per thread
 
-// Kernel
+// Lane grouping: PR * PC == 32
+// SAFE mapping: PC=8 (8 col-groups -> TN=4 => 32 cols/phase), PR=4 (4 row-groups -> TM=4 => 16 rows/phase)
+#define PC 8
+#define PR (32 / PC)         // 4
+
+#define ROW_STRIDE (PR * TM) // 4 * 4 = 16
+#define COL_STRIDE (PC * TN) // 8 * 4 = 32
+#define ROW_PHASES (WM / ROW_STRIDE)  // 64/16 = 4
+#define COL_PHASES (WN / COL_STRIDE)  // 64/32 = 2
+
+// 128-bit copy quanta
+#define A_COPY_BYTES 16              // 8 halves
+
+// ----------------- helpers -----------------
+__device__ __forceinline__ uint8_t* align_ptr(uint8_t* p, int align) {
+    uintptr_t v = reinterpret_cast<uintptr_t>(p);
+    v = (v + (align - 1)) & ~(uintptr_t)(align - 1);
+    return reinterpret_cast<uint8_t*>(v);
+}
+
+#if __CUDA_ARCH__ >= 800
+static __device__ __forceinline__
+void cp_async_16B(void* smem_ptr, const void* gmem_ptr) {
+    unsigned smem = static_cast<unsigned>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem), "l"(gmem_ptr));
+}
+static __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n"); }
+static __device__ __forceinline__ void cp_async_wait()   { asm volatile("cp.async.wait_group 0;\n"); }
+#else
+static __device__ __forceinline__ void cp_async_16B(void* smem_ptr, const void* gmem_ptr) {
+    *reinterpret_cast<uint4*>(smem_ptr) = *reinterpret_cast<const uint4*>(gmem_ptr); // requires 16B alignment
+}
+static __device__ __forceinline__ void cp_async_commit() {}
+static __device__ __forceinline__ void cp_async_wait()   {}
+#endif
+
+// ----------------- Kernel -----------------
 extern "C" __global__
-void ternary_wmma_gemm_fused(
+void ternary_bitserial_gemm_tiled(
     const half* __restrict__ A,           // [M x K], row-major
-    const uint32_t* __restrict__ B_nz,    // [K x ceil(N/32)], bitplane: nonzero?
-    const uint32_t* __restrict__ B_sgn,   // [K x ceil(N/32)], bitplane: sign (1=-1)
+    const uint32_t* __restrict__ B_nz,    // [K x ceil(N/32)]
+    const uint32_t* __restrict__ B_sgn,   // [K x ceil(N/32)]
     const float* __restrict__ bias,       // [N] or nullptr
     half* __restrict__ C,                 // [M x N], row-major
     int M, int N, int K,
     float alpha,
     int relu
 ) {
-    // Block origin in C
+    // ----------------- Block / Warp coords -----------------
     const int block_m0 = blockIdx.y * BM;
     const int block_n0 = blockIdx.x * BN;
     if (block_m0 >= M || block_n0 >= N) return;
 
-    const int lane_id = threadIdx.x & 31;     // 0..31
-    const int warp_id = threadIdx.x >> 5;     // 0..7
-    const int warp_m  = warp_id % WARPS_M;    // 0..3
-    const int warp_n  = warp_id / WARPS_M;    // 0..1
+    const int tid     = threadIdx.x;
+    const int warp_id = tid / WARP_SIZE;     // 0..3
+    const int lane    = tid % WARP_SIZE;
 
-    const int warp_m0 = block_m0 + warp_m * WM_TILE; // 32-step
-    const int warp_n0 = block_n0 + warp_n * WN_TILE; // 64-step
+    // Warps arranged 2x2 per CTA
+    const int warp_m0 = block_m0 + (warp_id % 2) * WM;
+    const int warp_n0 = block_n0 + (warp_id / 2) * WN;
 
-    // Shared memory: A_smem [BM x BK] (row-major), B_smem [BK x BN] (col-major)
-    extern __shared__ half smem[];
-    half* A_smem = smem;                 // ld = BK
-    half* B_smem = A_smem + BM * BK;     // stored col-major: ld = BK
+    // Thread coords inside one phase of the warp tile
+    const int lane_row = (lane / PC) * TM;   // PR groups along rows
+    const int lane_col = (lane % PC) * TN;   // PC groups along cols
 
-    // Accumulators (2x4 WMMA tiles per warp)
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>
-        acc[WARP_TILES_M][WARP_TILES_N];
+    // ----------------- Shared memory (A only) -----------------
+    extern __shared__ uint8_t smem[];
+    uint8_t* p = smem;
+    p = align_ptr(p, 128);
+    half* As = reinterpret_cast<half*>(p);
+    const size_t As_elems = size_t(BM) * BK;
+    p += 2 * As_elems * sizeof(half); // double buffer
+    half* As_buf[2] = { As, As + As_elems };
 
-    #pragma unroll
-    for (int tm = 0; tm < WARP_TILES_M; ++tm) {
-        #pragma unroll
-        for (int tn = 0; tn < WARP_TILES_N; ++tn) {
-            wmma::fill_fragment(acc[tm][tn], 0.0f);
+    // ----------------- Accumulator (per-thread TMxTN tile) -----------------
+    float acc[TM][TN];
+
+    // ----------------- Prefetch A-tile (zero all rows; safe tails) -----------------
+    auto prefetch_A_tile = [&](int k0, int buf) {
+        // Zero A slab (avoid stale reads for M<BM or tail K)
+        for (int r = tid; r < BM; r += blockDim.x) {
+            half* sA_row = As_buf[buf] + r * BK;
+            #pragma unroll 1
+            for (int c = 0; c < BK; ++c) sA_row[c] = __float2half(0.f);
         }
+        __syncthreads();
+
+        // Copy valid A rows
+        const int valid_rows_A = min(BM, M - block_m0);
+        const int valid_cols_A = min(BK, K - k0);         // halves
+        const int row_bytes_A  = valid_cols_A * int(sizeof(half));
+        for (int r = tid; r < valid_rows_A; r += blockDim.x) {
+            const char* gA_row = reinterpret_cast<const char*>(A + (block_m0 + r) * K + k0);
+            char*       sA_row = reinterpret_cast<char*>(As_buf[buf] + r * BK);
+            const uintptr_t gA = reinterpret_cast<uintptr_t>(gA_row);
+            const uintptr_t sA = reinterpret_cast<uintptr_t>(sA_row);
+            const bool aligned16 = ((gA | sA) & 0xF) == 0;
+
+            if (aligned16) {
+                const int full16 = row_bytes_A / A_COPY_BYTES;
+                const int tail   = row_bytes_A - full16 * A_COPY_BYTES;
+                for (int cch = 0; cch < full16; ++cch) {
+                    cp_async_16B(sA_row + cch * A_COPY_BYTES, gA_row + cch * A_COPY_BYTES);
+                }
+                for (int t = 0; t < tail; ++t) {
+                    sA_row[full16 * A_COPY_BYTES + t] = gA_row[full16 * A_COPY_BYTES + t];
+                }
+            } else {
+                // scalar halves
+                const half* gA_h = reinterpret_cast<const half*>(gA_row);
+                half*       sA_h = reinterpret_cast<half*>(sA_row);
+                #pragma unroll 1
+                for (int c = 0; c < valid_cols_A; ++c) sA_h[c] = gA_h[c];
+            }
+        }
+#if __CUDA_ARCH__ >= 800
+        cp_async_commit();
+#endif
+    };
+
+    // Preload A stage 0
+    int buf = 0;
+    if (K > 0) {
+        prefetch_A_tile(0, buf);
+#if __CUDA_ARCH__ >= 800
+        cp_async_wait();
+#endif
+        __syncthreads();
     }
 
-    const int words_per_row = (N + 31) >> 5;  // ceil(N/32)
+    // Geometry for B (global access)
+    const int words_per_row = (N + 31) >> 5;
 
-    // Iterate over K in tiles of BK=16
-    for (int k0 = 0; k0 < K; k0 += BK) {
+    // ----------------- Phase loops (cover full 64x64 warp tile) -----------------
+    for (int fr = 0; fr < ROW_PHASES; ++fr) {
+        for (int fc = 0; fc < COL_PHASES; ++fc) {
 
-        // ---- Cooperative load A tile [BM x BK] into shared (row-major) ----
-        // All 256 threads share the work; no redundant loads.
-        for (int t = threadIdx.x; t < BM * BK; t += blockDim.x) {
-            int r = t / BK;           // 0..127
-            int c = t % BK;           // 0..15
-            int gr = block_m0 + r;
-            int gc = k0 + c;
-            half v = __float2half(0.0f);
-            if (gr < M && gc < K) v = A[gr * K + gc];
-            A_smem[r * BK + c] = v;
-        }
-
-        // ---- Decode B for this K-slice into shared (col-major) ----
-        // For each kk in [0..BK), we have BN columns inside the block-N tile.
-        // Expand 32-bit words -> 32 halfs at a time, and store at B_smem[col * BK + kk]
-        for (int t = threadIdx.x; t < BK * ((BN + 31) >> 5); t += blockDim.x) {
-            int kk   = t / ((BN + 31) >> 5);             // 0..15 within this k-slice
-            int widx = t % ((BN + 31) >> 5);             // 0..ceil(BN/32)-1 within tile
-            int gk   = k0 + kk;
-            int gword = (block_n0 >> 5) + widx;          // global word index along N
-
-            uint32_t nz = 0u, sg = 0u;
-            if (gk < K && (gword < words_per_row)) {
-                nz = B_nz[gk * words_per_row + gword];
-                sg = B_sgn[gk * words_per_row + gword];
+            // Preload bias for this phase (TN columns per thread)
+            float bias_reg[TN];
+            #pragma unroll
+            for (int j=0; j<TN; ++j) {
+                int gcol = warp_n0 + fc*COL_STRIDE + lane_col + j;
+                bias_reg[j] = (bias && gcol < N) ? bias[gcol] : 0.f;
             }
 
-            // Expand to 32 columns (may spill past N at right edge; guard later)
-            int base_col = (gword << 5) - block_n0;      // local col 0-based within BN
-            // For each bit -> write one half into B_smem at [col * BK + kk]
-            // Keep B_smem col-major so WMMA_B col_major with ld=BK works.
+            // zero accumulators
             #pragma unroll
-            for (int b = 0; b < 32; ++b) {
-                int j = base_col + b;                   // 0..BN-1 (local col)
-                if (j >= 0 && j < BN) {
-                    int g_n = block_n0 + j;
-                    half hv = __float2half(0.0f);
-                    if (gk < K && g_n < N) {
-                        int bit = 1 & (nz >> b);
-                        if (bit) {
-                            int s = 1 & (sg >> b);
-                            hv = __int2half_rn(s ? -1 : 1);
+            for (int ii=0; ii<TM; ++ii)
+                #pragma unroll
+                for (int jj=0; jj<TN; ++jj)
+                    acc[ii][jj] = 0.f;
+
+            // Iterate K with double-buffered A tiles
+            for (int k0 = 0; k0 < K; k0 += BK) {
+                const int nxt = buf ^ 1;
+                if (k0 + BK < K) prefetch_A_tile(k0 + BK, nxt);
+
+                half* As_cur = As_buf[buf];
+
+                // ---- Compute on current A tile; read B directly per-column ----
+                #pragma unroll 4
+                for (int kk = 0; kk < BK; ++kk) {
+                    const int gk = k0 + kk;
+                    if (gk >= K) break;
+
+                    // Load A rows this thread needs (phase-adjusted)
+                    float a_reg[TM];
+                    #pragma unroll
+                    for (int i=0; i<TM; ++i) {
+                        int row_local = (warp_m0 - block_m0) + fr*ROW_STRIDE + lane_row + i; // 0..BM-1
+                        a_reg[i] = (row_local >= 0 && row_local < BM) ? __half2float(As_cur[row_local*BK + kk]) : 0.f;
+                    }
+
+                    // Process TN columns: compute word and bit per column j
+                    #pragma unroll
+                    for (int j=0; j<TN; ++j) {
+                        const int col = warp_n0 + fc*COL_STRIDE + lane_col + j;
+                        if (col >= N) break;
+
+                        const int w = col >> 5;           // word index for this column
+                        const int b = col & 31;           // bit index in that word
+                        // Bounds check on words_per_row
+                        if ((unsigned)w >= (unsigned)words_per_row) continue;
+
+                        const uint32_t nz_bits = B_nz[gk * words_per_row + w];
+                        if (((nz_bits >> b) & 1u) == 0u) continue;
+
+                        const uint32_t sg_bits = B_sgn[gk * words_per_row + w];
+                        const float add = ((sg_bits >> b) & 1u) ? -1.f : 1.f;
+
+                        #pragma unroll
+                        for (int i=0; i<TM; ++i) {
+                            acc[i][j] += a_reg[i] * add;
                         }
                     }
-                    B_smem[j * BK + kk] = hv;  // col-major write
                 }
-            }
-        }
 
-        __syncthreads();
-
-        // ---- MMA on this A/B tile ----
-        #pragma unroll
-        for (int kk = 0; kk < BK; kk += WMMA_K) {
-            #pragma unroll
-            for (int tm = 0; tm < WARP_TILES_M; ++tm) {
-                #pragma unroll
-                for (int tn = 0; tn < WARP_TILES_N; ++tn) {
-
-                    const int a_row = (warp_m * WM_TILE) + tm * WMMA_M; // in [0..127]
-                    const int b_col = (warp_n * WN_TILE) + tn * WMMA_N; // in [0..127]
-
-                    // Fragments
-                    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K,
-                                   half, wmma::row_major> a_frag;
-                    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K,
-                                   half, wmma::col_major> b_frag;
-
-                    // A_smem is [BM x BK], ld = BK, row-major
-                    const half* a_ptr = &A_smem[a_row * BK + kk];
-                    // B_smem is [BK x BN] but stored col-major, ld = BK
-                    const half* b_ptr = &B_smem[b_col * BK + kk];
-
-                    // NOTE: For col_major matrix_b, leading dimension MUST be BK
-                    wmma::load_matrix_sync(a_frag, a_ptr, BK);
-                    wmma::load_matrix_sync(b_frag, b_ptr, BK);
-
-                    wmma::mma_sync(acc[tm][tn], a_frag, b_frag, acc[tm][tn]);
+                // Wait only at tile boundary
+                if (k0 + BK < K) {
+#if __CUDA_ARCH__ >= 800
+                    cp_async_wait();
+#endif
+                    __syncthreads();
                 }
-            }
-        }
 
-        __syncthreads();
-    }
+                buf = nxt;
+            } // k0
 
-    // ---- Store (directly to global) with fused epilogue ----
-    #pragma unroll
-    for (int tm = 0; tm < WARP_TILES_M; ++tm) {
-        #pragma unroll
-        for (int tn = 0; tn < WARP_TILES_N; ++tn) {
-            const int tile_m0 = warp_m0 + tm * WMMA_M;
-            const int tile_n0 = warp_n0 + tn * WMMA_N;
-
-            float out_frag[WMMA_M * WMMA_N];
-            wmma::store_matrix_sync(out_frag, acc[tm][tn], WMMA_N, wmma::mem_row_major);
-
+            // ----------------- Epilogue store for this (fr,fc) phase -----------------
             #pragma unroll
-            for (int i = 0; i < WMMA_M; ++i) {
-                int row = tile_m0 + i;
-                if (row >= M) break;
+            for (int i=0; i<TM; ++i) {
+                int row = warp_m0 + fr*ROW_STRIDE + lane_row + i;  // global row
+                if (row >= M) continue;
                 #pragma unroll
-                for (int j = 0; j < WMMA_N; ++j) {
-                    int col = tile_n0 + j;
-                    if (col >= N) break;
-
-                    float v = out_frag[i * WMMA_N + j] * alpha;
-                    if (bias) v += bias[col];
-                    if (relu) v = v > 0.f ? v : 0.f;
+                for (int j=0; j<TN; ++j) {
+                    int col = warp_n0 + fc*COL_STRIDE + lane_col + j;  // global col
+                    if (col >= N) continue;
+                    float v = acc[i][j] * alpha;                // scale
+                    v += bias_reg[j];                           // bias from registers
+                    if (relu) v = v > 0.f ? v : 0.f;            // activation
                     C[row * N + col] = __float2half_rn(v);
                 }
             }
-        }
-    }
+
+        } // fc
+    } // fr
 }
 
-// Host wrapper (unchanged signature)
+// ----------------- Host launcher -----------------
 extern "C"
 void launch_ternary_linear_cuda(const at::Half* A,
                                 const uint32_t* B_nz,
@@ -195,16 +262,114 @@ void launch_ternary_linear_cuda(const at::Half* A,
                                 float alpha,
                                 const float* bias,
                                 int relu) {
-    dim3 block(256);  // 8 warps × 32 threads
+    dim3 block(THREADS);
     dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
 
-    // Shared: A (BM*BK half) + B (BK*BN half)
-    size_t smem_size = (BM * BK + BK * BN) * sizeof(half); // 4096 + 4096 = 8192 bytes
+    const size_t smem = 2 * (size_t)BM * BK * sizeof(half); // A only (double buffer)
 
-    ternary_wmma_gemm_fused<<<grid, block, smem_size>>>(
+    ternary_bitserial_gemm_tiled<<<grid, block, smem>>>(
         reinterpret_cast<const half*>(A),
-        B_nz, B_sgn, bias,
+        B_nz, B_sgn,
+        bias,
         reinterpret_cast<half*>(C),
         M, N, K,
         alpha, relu);
+}
+
+// ===================== DEBUG KERNELS =====================
+
+extern "C" __global__
+void ternary_decode_to_dense_kn_kernel(
+    const uint32_t* __restrict__ B_nz,    // [K x ceil(N/32)]
+    const uint32_t* __restrict__ B_sgn,   // [K x ceil(N/32)]
+    int8_t* __restrict__ W_kn,            // [K x N], signed int8 {-1,0,1}
+    int K, int N
+) {
+    int k = blockIdx.y * blockDim.y + threadIdx.y; // 0..K-1
+    int n = blockIdx.x * blockDim.x + threadIdx.x; // 0..N-1
+    if (k >= K || n >= N) return;
+    int words_per_row = (N + 31) >> 5;
+    int w = n >> 5;
+    int b = n & 31;
+
+    uint32_t nz = B_nz[k * words_per_row + w];
+    if (((nz >> b) & 1u) == 0u) {
+        W_kn[k * N + n] = 0;
+        return;
+    }
+    uint32_t sg = B_sgn[k * words_per_row + w];
+    int8_t v = ((sg >> b) & 1u) ? int8_t(-1) : int8_t(1);
+    W_kn[k * N + n] = v;
+}
+
+extern "C" void launch_ternary_decode_to_dense_kn(
+    const uint32_t* B_nz,
+    const uint32_t* B_sgn,
+    int8_t* W_kn,
+    int K, int N
+) {
+    dim3 block(32, 8); // 256 thr
+    dim3 grid((N + block.x - 1) / block.x,
+              (K + block.y - 1) / block.y);
+    ternary_decode_to_dense_kn_kernel<<<grid, block>>>(
+        B_nz, B_sgn, W_kn, K, N
+    );
+}
+
+// Slow but correct reference GEMM on GPU (FP32 accumulate, then cast to FP16)
+extern "C" __global__
+void ternary_naive_forward_kernel(
+    const half* __restrict__ A,         // [M x K], row-major
+    const uint32_t* __restrict__ B_nz,  // [K x ceil(N/32)]
+    const uint32_t* __restrict__ B_sgn, // [K x ceil(N/32)]
+    const float* __restrict__ bias,     // [N] or nullptr
+    half* __restrict__ C,               // [M x N], row-major
+    int M, int N, int K,
+    float alpha,
+    int relu
+) {
+    int m = blockIdx.y * blockDim.y + threadIdx.y; // row
+    int n = blockIdx.x * blockDim.x + threadIdx.x; // col
+    if (m >= M || n >= N) return;
+
+    const int words_per_row = (N + 31) >> 5;
+    const int w = n >> 5;
+    const int b = n & 31;
+
+    float acc = 0.f;
+    for (int k = 0; k < K; ++k) {
+        uint32_t nz = B_nz[k * words_per_row + w];
+        if (((nz >> b) & 1u) == 0u) continue;
+        uint32_t sg = B_sgn[k * words_per_row + w];
+        float add = ((sg >> b) & 1u) ? -1.f : 1.f;
+        float a = __half2float(A[m * K + k]);
+        acc += a * add;
+    }
+    acc *= alpha;
+    if (bias) acc += bias[n];
+    if (relu) acc = acc > 0.f ? acc : 0.f;
+    C[m * N + n] = __float2half_rn(acc);
+}
+
+extern "C" void launch_ternary_linear_naive(
+    const at::Half* A,
+    const uint32_t* B_nz,
+    const uint32_t* B_sgn,
+    at::Half* C,
+    int M, int N, int K,
+    float alpha,
+    const float* bias,
+    int relu
+) {
+    dim3 block(32, 8); // 256 thr
+    dim3 grid((N + block.x - 1) / block.x,
+              (M + block.y - 1) / block.y);
+    ternary_naive_forward_kernel<<<grid, block>>>(
+        reinterpret_cast<const half*>(A),
+        B_nz, B_sgn,
+        bias,
+        reinterpret_cast<half*>(C),
+        M, N, K,
+        alpha, relu
+    );
 }
